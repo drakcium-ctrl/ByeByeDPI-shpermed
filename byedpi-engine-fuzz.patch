@@ -1,0 +1,82 @@
+--- a/app/src/main/cpp/byedpi/desync.c	2026-11-08 19:21:20.182291117 +0000
++++ b/app/src/main/cpp/byedpi/desync.c	2026-11-08 19:21:32.682105327 +0000
+@@ -466,6 +466,14 @@
+     else if (pos < 0 || (flag & OFFSET_END)) {
+         pos += n;
+     }
++    if (flag & OFFSET_FUZZ) {
++        /* +p flag: randomize the final offset within ±(|pos|/4) but at least ±2.
++           This breaks fixed-offset fingerprints without crossing SNI boundaries. */
++        long fuzz_range = (pos < 0 ? -pos : pos) / 4;
++        if (fuzz_range < 2) fuzz_range = 2;
++        long delta = (long)(rand() % (fuzz_range * 2 + 1)) - fuzz_range;
++        pos += delta;
++    }
+     return pos;
+ }
+ 
+@@ -521,6 +529,10 @@
+         struct eval *val, struct buffer *buff, ssize_t *np, bool *wait)
+ {
+     struct desync_params dp = *val->pair->dp;
++    /* Randomise TTL per-connection when ttl_range > 0 */
++    if (dp.ttl_range > 0) {
++        dp.ttl = dp.ttl + (rand() % dp.ttl_range);
++    }
+     struct proto_info info = { 0 };
+     
+     int sfd = val->fd;
+--- a/app/src/main/cpp/byedpi/main.c	2026-11-08 19:21:20.182490685 +0000
++++ b/app/src/main/cpp/byedpi/main.c	2026-11-08 19:22:09.465127049 +0000
+@@ -176,6 +176,7 @@
+     {"fake-sni",      1, 0, 'n'},
+     #endif
+     {"ttl",           1, 0, 't'},
++    {"ttl-range",     1, 0, 'z'},
+     {"fake-data",     1, 0, 'l'},
+     {"fake-offset",   1, 0, 'O'},
+     {"fake-tls-mod",  1, 0, 'Q'},
+@@ -612,6 +613,10 @@
+                 break;
+             case 's': //
+                 part->flag |= OFFSET_START;
++                break;
++            case 'p': /* fuzz: randomise position +-25% per connection */
++                part->flag |= OFFSET_FUZZ;
++                break;
+         }
+     }
+     else if (*end) {
+@@ -1107,6 +1112,14 @@
+             else
+                 dp->ttl = val;
+             break;
++        
++        case 'z':
++            val = strtol(optarg, &end, 0);
++            if (val < 1 || val > 128 || *end)
++                invalid = 1;
++            else
++                dp->ttl_range = (int)val;
++            break;
+             
+         case 'S':
+             dp->md5sig = 1;
+--- a/app/src/main/cpp/byedpi/params.h	2026-11-08 19:21:20.182543636 +0000
++++ b/app/src/main/cpp/byedpi/params.h	2026-11-08 19:21:20.218234179 +0000
+@@ -28,6 +28,7 @@
+ #define OFFSET_SNI 8
+ #define OFFSET_HOST 16
+ #define OFFSET_START 32
++#define OFFSET_FUZZ  64
+ 
+ #define DETECT_HTTP_LOCAT 1
+ #define DETECT_TLS_ERR 2
+@@ -93,6 +94,7 @@
+ 
+ struct desync_params {
+     int ttl;
++    int ttl_range;   /* if >0, actual TTL = ttl + rand()%ttl_range per-connection */
+     bool md5sig;
+     struct packet fake_data;
+     int udp_fake_count;

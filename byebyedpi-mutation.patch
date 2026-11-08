@@ -1,0 +1,371 @@
+diff -ruN orig/ByeByeDPI-v.1.8.1/app/src/main/assets/proxytest_strategies.list ByeByeDPI-v.1.8.1/app/src/main/assets/proxytest_strategies.list
+--- a/app/src/main/assets/proxytest_strategies.list	2026-09-29 16:32:21.000000000 +0000
++++ b/app/src/main/assets/proxytest_strategies.list	2026-11-08 10:15:40.473322595 +0000
+@@ -57,4 +57,9 @@
+ -q1 -r25+s -a1
+ -d1 -s3+s -a1
+ -o3 -d7 -a1
+--d7 -s2 -a1
+\ No newline at end of file
++-d7 -s2 -a1
++-s1+s -r1+s -a1
++-d1 -r3+s -s5+s -s10+s -a1
++-n {sni} -Qr -f-1 -s1+s -r1+s -a1
++-s2+s -r2+s -d3+s -n {sni} -Qr -f-1 -t6 -a1
++-o1 -r1+s -s3+s -a1 -At,r,s -d1 -r5+s -a1
+\ No newline at end of file
+diff -ruN orig/ByeByeDPI-v.1.8.1/app/src/main/java/io/github/romanvht/byedpi/data/TestSettings.kt ByeByeDPI-v.1.8.1/app/src/main/java/io/github/romanvht/byedpi/data/TestSettings.kt
+--- a/app/src/main/java/io/github/romanvht/byedpi/data/TestSettings.kt	2026-09-29 16:32:21.000000000 +0000
++++ b/app/src/main/java/io/github/romanvht/byedpi/data/TestSettings.kt	2026-11-08 10:15:19.158214276 +0000
+@@ -9,4 +9,6 @@
+     val requestsCount: Int,
+     val requestTimeout: Long,
+     val requestLimit: Int,
++    val mutate: Boolean = false,
++    val sniPool: List<String> = emptyList(),
+ )
+diff -ruN orig/ByeByeDPI-v.1.8.1/app/src/main/java/io/github/romanvht/byedpi/services/TestService.kt ByeByeDPI-v.1.8.1/app/src/main/java/io/github/romanvht/byedpi/services/TestService.kt
+--- a/app/src/main/java/io/github/romanvht/byedpi/services/TestService.kt	2026-09-29 16:32:21.000000000 +0000
++++ b/app/src/main/java/io/github/romanvht/byedpi/services/TestService.kt	2026-11-08 10:15:19.158545791 +0000
+@@ -38,6 +38,8 @@
+         private const val CHANNEL = "Proxy test"
+         private const val RESULTS_FILE = "proxy_test_results.json"
+         private const val NOTIFICATION_ID = 4
++        private const val MUTATION_SEEDS = 3
++        private const val MUTATIONS_PER_SEED = 5
+         private val mutableState = MutableStateFlow(TestState())
+         private val resultsLock = Any()
+         val state: StateFlow<TestState> = mutableState.asStateFlow()
+@@ -191,27 +193,50 @@
+                 getPreferences().edit(commit = true) { putBoolean("is_test_running", true) }
+                 publish(strategies, 0)
+                 ServiceManager.waitStop()
+-                val configurations = withContext(Dispatchers.IO) {
+-                    options.commands.map { command ->
+-                        runCatching { testConfiguration(this@TestService, command, options.host, options.port) }
++                suspend fun runBatch(batch: List<StrategyResult>, offset: Int) {
++                    val configurations = withContext(Dispatchers.IO) {
++                        batch.map { strategy ->
++                            runCatching { testConfiguration(this@TestService, strategy.command, options.host, options.port) }
++                        }
++                    }
++
++                    for ((index, strategy) in batch.withIndex()) {
++                        currentCoroutineContext().ensureActive()
++                        currentStrategy = strategy
++                        strategy.totalRequests = options.sites.size * options.requestsCount
++                        publish(strategies, offset + index + 1)
++                        val configuration = configurations[index].getOrNull()
++                        if (configuration == null || !checkStrategy(strategy, strategies, configuration, options)) {
++                            resetStrategyResult(strategy, options)
++                        }
++                        strategy.isCompleted = true
++                        publish(strategies)
++                        saveResults(strategies)
++                        stopEngine()
++                        currentStrategy = null
++                        delay(options.delaySec * 500L)
+                     }
+                 }
+ 
+-                for ((index, strategy) in strategies.withIndex()) {
+-                    ensureActive()
+-                    currentStrategy = strategy
+-                    strategy.totalRequests = options.sites.size * options.requestsCount
+-                    publish(strategies, index + 1)
+-                    val configuration = configurations[index].getOrNull()
+-                    if (configuration == null || !checkStrategy(strategy, strategies, configuration, options)) {
+-                        resetStrategyResult(strategy, options)
++                runBatch(strategies.toList(), 0)
++
++                if (options.mutate) {
++                    // Second pass: mutate the best strategies and test the variants.
++                    val seeds = strategies
++                        .filter { it.successCount > 0 }
++                        .sortedByDescending { it.successCount }
++                        .take(MUTATION_SEEDS)
++                    val known = strategies.map { it.command }.toMutableSet()
++                    val variants = seeds
++                        .flatMap { StrategyMutator.mutate(it.command, MUTATIONS_PER_SEED, options.sniPool) }
++                        .filter { known.add(it) }
++                    if (variants.isNotEmpty()) {
++                        val offset = strategies.size
++                        val batch = variants.map { StrategyResult(command = it) }
++                        strategies.addAll(batch)
++                        publish(strategies, offset)
++                        runBatch(batch, offset)
+                     }
+-                    strategy.isCompleted = true
+-                    publish(strategies)
+-                    saveResults(strategies)
+-                    stopEngine()
+-                    currentStrategy = null
+-                    delay(options.delaySec * 500L)
+                 }
+             } catch (e: CancellationException) {
+                 throw e
+@@ -346,9 +371,11 @@
+         val requestsCount = prefs.getIntStringNotNull("byedpi_proxytest_requests", 1).coerceAtLeast(1)
+         val requestTimeout = prefs.getLongStringNotNull("byedpi_proxytest_timeout", 5).coerceAtLeast(1)
+         val requestLimit = prefs.getIntStringNotNull("byedpi_proxytest_limit", 20).coerceAtLeast(1)
++        val mutate = prefs.getBoolean("byedpi_proxytest_mutation", false)
++        val sniPool = (listOf(sniValue) + StrategyMutator.DEFAULT_SNI_POOL).distinct()
+         DomainListUtils.syncLists(this)
+         return TestSettings(DomainListUtils.getActiveDomains(this).toList(), commands, host, port,
+-            delaySec, requestsCount, requestTimeout, requestLimit)
++            delaySec, requestsCount, requestTimeout, requestLimit, mutate, sniPool)
+     }
+ 
+     private fun resetStrategyResult(strategy: StrategyResult, settings: TestSettings) {
+diff -ruN orig/ByeByeDPI-v.1.8.1/app/src/main/java/io/github/romanvht/byedpi/utility/StrategyMutator.kt ByeByeDPI-v.1.8.1/app/src/main/java/io/github/romanvht/byedpi/utility/StrategyMutator.kt
+--- a/app/src/main/java/io/github/romanvht/byedpi/utility/StrategyMutator.kt	1970-01-01 00:00:00.000000000 +0000
++++ b/app/src/main/java/io/github/romanvht/byedpi/utility/StrategyMutator.kt	2026-11-08 10:19:04.921813850 +0000
+@@ -0,0 +1,171 @@
++package io.github.romanvht.byedpi.utility
++
++import java.util.Random
++import kotlin.math.abs
++
++/**
++ * Produces small random variations of a ByeDPI command line.
++ *
++ * Used by the proxy test: the best strategies found by the normal run are mutated
++ * and the variants are tested against the same sites. This helps when a DPI box
++ * fingerprints the exact parameters of a popular strategy (fixed split offset,
++ * fixed fake TTL, fixed fake SNI).
++ *
++ * Only short options with the well-known syntax are touched (-s -d -o -q -f -r -t -n -Qr),
++ * everything else (auto groups -A/-a, host lists, long options) is preserved as is.
++ * Mutations stay inside conservative ranges so that variants remain valid commands.
++ */
++object StrategyMutator {
++    private const val MAX_ATTEMPTS_FACTOR = 12
++
++    /** Fake SNI candidates; the SNI chosen by the user in the test settings is added on top. */
++    val DEFAULT_SNI_POOL = listOf(
++        "google.com",
++        "yandex.ru",
++        "vk.com",
++        "mail.ru",
++        "ozon.ru",
++        "microsoft.com",
++        "cloudflare.com",
++        // ByeDPI replaces ? # * with a random letter / digit / letter-or-digit for every request
++        "?????.yandex.ru",
++        "*****.vk.com",
++    )
++
++    // -s3 | -d1 | -f-200 | -s3:5+sm | -d2:5:2+h | -r5+s
++    private val positionOption = Regex("""^-([sdoqfr])(-?\d+)((?::\d+){0,2})((?:\+[a-z]+)?)$""")
++    private val ttlOption = Regex("""^-t(\d+)$""")
++
++    fun mutate(
++        command: String,
++        count: Int,
++        sniPool: List<String> = DEFAULT_SNI_POOL,
++        random: Random = Random(),
++    ): List<String> {
++        val base = shellSplit(command)
++        if (base.isEmpty() || count <= 0) return emptyList()
++
++        val baseNormalized = join(base)
++        val baseViolations = orderViolations(base)
++        val result = LinkedHashSet<String>()
++        var attempts = 0
++        while (result.size < count && attempts < count * MAX_ATTEMPTS_FACTOR) {
++            attempts++
++            val tokens = base.toMutableList()
++            val operations = 1 + random.nextInt(2)
++            repeat(operations) { applyRandomOperation(tokens, sniPool, random) }
++            if (orderViolations(tokens) > baseViolations) continue
++            val candidate = join(tokens)
++            if (candidate != baseNormalized) result.add(candidate)
++        }
++        return result.toList()
++    }
++
++    /**
++     * ByeDPI expects positions in ascending order. Counts offsets that go backwards among
++     * options with the same kind (tlsrec vs. the rest), flags and sign inside one auto group.
++     * Some stock strategies already have such cases, so callers compare against the base command.
++     */
++    private fun orderViolations(tokens: List<String>): Int {
++        var violations = 0
++        var last = HashMap<Triple<Boolean, String, Boolean>, Int>()
++        for (token in tokens) {
++            if (token.startsWith("-A")) {
++                last = HashMap()
++                continue
++            }
++            val match = positionOption.matchEntire(token) ?: continue
++            val offset = match.groupValues[2].toIntOrNull() ?: continue
++            val key = Triple(match.groupValues[1] == "r", match.groupValues[4], offset < 0)
++            val previous = last[key]
++            if (previous != null && offset < previous) violations++
++            last[key] = offset
++        }
++        return violations
++    }
++
++    private fun applyRandomOperation(tokens: MutableList<String>, sniPool: List<String>, random: Random) {
++        when (random.nextInt(6)) {
++            0, 1 -> shiftOffset(tokens, random)
++            2 -> changeTtl(tokens, random)
++            3 -> swapSni(tokens, sniPool, random)
++            4 -> toggleFakeRandomization(tokens)
++            5 -> addTlsRecord(tokens, random)
++        }
++    }
++
++    private fun positionIndexes(tokens: List<String>, kinds: String = "sdoqfr"): List<Int> =
++        tokens.indices.filter { i ->
++            positionOption.matchEntire(tokens[i])?.groupValues?.get(1)?.let { kinds.contains(it) } == true
++        }
++
++    private fun hasFake(tokens: List<String>) = positionIndexes(tokens, "f").isNotEmpty()
++
++    /** Moves one split/disorder/oob/fake/tlsrec offset by a few bytes, keeping its sign and flags. */
++    private fun shiftOffset(tokens: MutableList<String>, random: Random) {
++        val indexes = positionIndexes(tokens)
++        if (indexes.isEmpty()) return
++        val i = indexes[random.nextInt(indexes.size)]
++        val match = positionOption.matchEntire(tokens[i]) ?: return
++        val (kind, offsetText, repeats, flags) = match.destructured
++        val offset = offsetText.toIntOrNull() ?: return
++        val magnitude = abs(offset)
++        val maxDelta = (magnitude / 4).coerceIn(2, 10)
++        var delta = 1 + random.nextInt(maxDelta)
++        if (random.nextBoolean()) delta = -delta
++        val newMagnitude = (magnitude + delta).coerceIn(1, 1000)
++        val newOffset = if (offset < 0) -newMagnitude else newMagnitude
++        tokens[i] = "-$kind$newOffset$repeats$flags"
++    }
++
++    /** Changes the TTL of fake packets (only when the strategy uses fake packets). */
++    private fun changeTtl(tokens: MutableList<String>, random: Random) {
++        val i = tokens.indexOfFirst { ttlOption.matches(it) }
++        val newTtl = 3 + random.nextInt(12) // 3..14
++        if (i >= 0) {
++            tokens[i] = "-t$newTtl"
++        } else if (hasFake(tokens)) {
++            tokens.add(0, "-t$newTtl")
++        }
++    }
++
++    /** Picks another fake SNI from the pool (only when the strategy uses fake packets). */
++    private fun swapSni(tokens: MutableList<String>, sniPool: List<String>, random: Random) {
++        if (sniPool.isEmpty()) return
++        val sni = sniPool[random.nextInt(sniPool.size)]
++        val separate = tokens.indexOf("-n")
++        if (separate >= 0 && separate + 1 < tokens.size) {
++            tokens[separate + 1] = sni
++            return
++        }
++        val glued = tokens.indexOfFirst { it.length > 2 && it.startsWith("-n") && it.contains('.') }
++        if (glued >= 0) {
++            tokens[glued] = "-n$sni"
++        } else if (hasFake(tokens)) {
++            tokens.add(0, sni)
++            tokens.add(0, "-n")
++        }
++    }
++
++    /** Toggles random ClientHello fields (SessionID/Random/KeyExchange) in fake packets. */
++    private fun toggleFakeRandomization(tokens: MutableList<String>) {
++        if (!hasFake(tokens)) return
++        val i = tokens.indexOf("-Qr")
++        if (i >= 0) tokens.removeAt(i) else tokens.add(0, "-Qr")
++    }
++
++    /** Adds a TLS record split (combined with TCP segmentation it is harder to reassemble). */
++    private fun addTlsRecord(tokens: MutableList<String>, random: Random) {
++        if (positionIndexes(tokens, "r").isNotEmpty()) return
++        val offset = 1 + random.nextInt(5)
++        tokens.add(0, "-r$offset+s")
++    }
++
++    private fun join(tokens: List<String>): String = tokens.joinToString(" ") { token ->
++        if (token.any { it.isWhitespace() || it == '"' || it == '\'' }) {
++            "\"" + token.replace("\"", "\\\"") + "\""
++        } else {
++            token
++        }
++    }
++}
+diff -ruN orig/ByeByeDPI-v.1.8.1/app/src/main/res/values/strings.xml ByeByeDPI-v.1.8.1/app/src/main/res/values/strings.xml
+--- a/app/src/main/res/values/strings.xml	2026-09-29 16:32:21.000000000 +0000
++++ b/app/src/main/res/values/strings.xml	2026-11-08 10:15:19.159406472 +0000
+@@ -145,6 +145,8 @@
+     <string name="test_log_copy">Скопировать лог</string>
+     <string name="toast_copied">Скопировано</string>
+     <string name="test_settings_sni">SNI фейк пакетов</string>
++    <string name="test_settings_mutation">Подбор вариаций лучших стратегий</string>
++    <string name="test_settings_mutation_desc">После основного теста берёт 3 лучшие стратегии и проверяет их случайные вариации (смещения, TTL, фейковый SNI). Тест становится дольше</string>
+     <string name="test_settings_fulllog">Вывод ответа хостов</string>
+     <string name="test_settings_logclickable">Все стратегии кликабельны</string>
+     <string name="test_settings_domain_lists">Списки доменов для проверки</string>
+diff -ruN orig/ByeByeDPI-v.1.8.1/app/src/main/res/values-en/strings.xml ByeByeDPI-v.1.8.1/app/src/main/res/values-en/strings.xml
+--- a/app/src/main/res/values-en/strings.xml	2026-09-29 16:32:21.000000000 +0000
++++ b/app/src/main/res/values-en/strings.xml	2026-11-08 10:15:19.159700930 +0000
+@@ -145,6 +145,8 @@
+     <string name="test_log_copy">Copy log</string>
+     <string name="toast_copied">Сopied</string>
+     <string name="test_settings_sni">SNI fake packets</string>
++    <string name="test_settings_mutation">Mutate best strategies</string>
++    <string name="test_settings_mutation_desc">After the main test, takes the 3 best strategies and tests random variations of them (offsets, TTL, fake SNI). The test takes longer</string>
+     <string name="test_settings_fulllog">Host response output</string>
+     <string name="test_settings_logclickable">All commands are clickable</string>
+     <string name="test_settings_domain_lists">Domain lists for testing</string>
+diff -ruN orig/ByeByeDPI-v.1.8.1/app/src/main/res/values-kk/strings.xml ByeByeDPI-v.1.8.1/app/src/main/res/values-kk/strings.xml
+--- a/app/src/main/res/values-kk/strings.xml	2026-09-29 16:32:21.000000000 +0000
++++ b/app/src/main/res/values-kk/strings.xml	2026-11-08 10:15:19.160174884 +0000
+@@ -145,6 +145,8 @@
+     <string name="test_log_copy">Журналды көшіру</string>
+     <string name="toast_copied">Нәтиже көшірілген</string>
+     <string name="test_settings_sni">SNI жалған пакеттері</string>
++    <string name="test_settings_mutation">Mutate best strategies</string>
++    <string name="test_settings_mutation_desc">After the main test, takes the 3 best strategies and tests random variations of them (offsets, TTL, fake SNI). The test takes longer</string>
+     <string name="test_settings_fulllog">Хосттар жауабын шығару</string>
+     <string name="test_settings_logclickable">Барлық стратегиялар кликабельді</string>
+     <string name="test_settings_domain_lists">Тексеруге арналған домен тізімдері</string>
+diff -ruN orig/ByeByeDPI-v.1.8.1/app/src/main/res/values-tr/strings.xml ByeByeDPI-v.1.8.1/app/src/main/res/values-tr/strings.xml
+--- a/app/src/main/res/values-tr/strings.xml	2026-09-29 16:32:21.000000000 +0000
++++ b/app/src/main/res/values-tr/strings.xml	2026-11-08 10:15:19.160724835 +0000
+@@ -145,6 +145,8 @@
+     <string name="test_log_copy">Günlük dosyasını kopyala</string>
+     <string name="toast_copied">Sonuç kopyalandı</string>
+     <string name="test_settings_sni">SNI sahte paketleri</string>
++    <string name="test_settings_mutation">Mutate best strategies</string>
++    <string name="test_settings_mutation_desc">After the main test, takes the 3 best strategies and tests random variations of them (offsets, TTL, fake SNI). The test takes longer</string>
+     <string name="test_settings_fulllog">Ana bilgisayar yanıt çıktısı</string>
+     <string name="test_settings_logclickable">Tüm stratejiler tıklanabilir</string>
+     <string name="test_settings_domain_lists">Test için alan adı listeleri</string>
+diff -ruN orig/ByeByeDPI-v.1.8.1/app/src/main/res/values-vi/strings.xml ByeByeDPI-v.1.8.1/app/src/main/res/values-vi/strings.xml
+--- a/app/src/main/res/values-vi/strings.xml	2026-09-29 16:32:21.000000000 +0000
++++ b/app/src/main/res/values-vi/strings.xml	2026-11-08 10:15:19.161159748 +0000
+@@ -146,6 +146,8 @@
+     <string name="test_log_copy">Sao chép nhật ký</string>
+     <string name="toast_copied">Đã sao chép</string>
+     <string name="test_settings_sni">Gói giả SNI</string>
++    <string name="test_settings_mutation">Mutate best strategies</string>
++    <string name="test_settings_mutation_desc">After the main test, takes the 3 best strategies and tests random variations of them (offsets, TTL, fake SNI). The test takes longer</string>
+     <string name="test_settings_fulllog">Hiển thị phản hồi host</string>
+     <string name="test_settings_logclickable">Tất cả lệnh đều có thể nhấn</string>
+     <string name="test_settings_domain_lists">Danh sách tên miền để kiểm tra</string>
+diff -ruN orig/ByeByeDPI-v.1.8.1/app/src/main/res/xml/proxy_test_settings.xml ByeByeDPI-v.1.8.1/app/src/main/res/xml/proxy_test_settings.xml
+--- a/app/src/main/res/xml/proxy_test_settings.xml	2026-09-29 16:32:21.000000000 +0000
++++ b/app/src/main/res/xml/proxy_test_settings.xml	2026-11-08 10:15:19.158732903 +0000
+@@ -42,6 +42,13 @@
+         app:useSimpleSummaryProvider="true"
+         app:iconSpaceReserved="false" />
+ 
++    <SwitchPreference
++        android:key="byedpi_proxytest_mutation"
++        android:title="@string/test_settings_mutation"
++        android:summary="@string/test_settings_mutation_desc"
++        android:defaultValue="false"
++        app:iconSpaceReserved="false" />
++
+     <Preference
+         android:key="manage_domain_lists"
+         android:title="@string/domain_lists"
