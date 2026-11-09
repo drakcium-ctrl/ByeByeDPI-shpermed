@@ -29,6 +29,8 @@ jobs:
         run: |
           patch -p1 < byedpi-engine-fuzz.patch
           patch -p1 < byebyedpi-mutation.patch
+          cd app/src/main/cpp/byedpi
+          patch -p1 < ../../../../../byedpi-udp-drop-port.patch
 
       - name: Build APK
         run: ./gradlew assembleDebug
