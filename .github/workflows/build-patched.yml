@@ -16,18 +16,19 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      - name: Accept Android SDK licenses
+        run: yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --licenses || true
+
+      - name: Install NDK and CMake
+        run: |
+          $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager \
+            "ndk;27.0.12077973" \
+            "cmake;3.22.1"
+
       - name: Apply patches
         run: |
           patch -p1 < byedpi-engine-fuzz.patch
           patch -p1 < byebyedpi-mutation.patch
-
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install NDK and CMake
-        run: |
-          sdkmanager "ndk;27.0.12077973"
-          sdkmanager "cmake;3.22.1"
 
       - name: Build APK
         run: ./gradlew assembleDebug
