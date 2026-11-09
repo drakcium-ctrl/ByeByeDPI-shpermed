@@ -1,0 +1,79 @@
+--- a/params.h	2026-11-10 03:21:52.934194577 +0700
++++ b/params.h	2026-11-10 03:22:06.869266626 +0700
+@@ -159,6 +159,8 @@
+     bool ipv6;
+     bool resolve;
+     bool udp;
++    uint16_t *udp_drop_ports;  /* ports to silently drop UDP (e.g. 443 for QUIC) */
++    int       udp_drop_ports_n;
+     bool delay_conn;
+     bool auto_reconnect;
+     int max_open;
+--- a/main.c	2026-11-10 03:21:53.244979505 +0700
++++ b/main.c	2026-11-10 03:22:23.136586754 +0700
+@@ -77,6 +77,7 @@
+     "    -c, --max-conn <count>    Connection count limit, default 512\n"
+     "    -N, --no-domain           Deny domain resolving\n"
+     "    -U, --no-udp              Deny UDP association\n"
++    "    --udp-drop-port <ports>  Drop UDP to ports (e.g. 443 for QUIC)\n"
+     "    -I  --conn-ip <ip>        Connection binded IP, default ::\n"
+     "    -b, --buf-size <size>     Buffer size, default 16384\n"
+     "    -x, --debug <level>       Print logs, 0, 1 or 2\n"
+@@ -136,6 +137,7 @@
+     {"no-domain",     0, 0, 'N'},
+     {"no-ipv6",       0, 0, 'X'},
+     {"no-udp",        0, 0, 'U'},
++    {"udp-drop-port", 1, 0, 1000},
+     {"help",          0, 0, 'h'},
+     {"version",       0, 0, 'v'},
+     {"ip",            1, 0, 'i'},
+@@ -786,6 +788,31 @@
+         case 'U':
+             params.udp = 0;
+             break;
++        case 1000: {
++            /* --udp-drop-port 443,80,... : drop UDP destined to these ports */
++            char *opt = strdup(optarg);
++            if (!opt) { invalid = 1; break; }
++            int cnt = 1;
++            for (char *p = opt; *p; p++) if (*p == ',') cnt++;
++            uint16_t *arr = malloc(cnt * sizeof(uint16_t));
++            if (!arr) { free(opt); invalid = 1; break; }
++            int i = 0;
++            char *tok = strtok(opt, ",");
++            while (tok && i < cnt) {
++                char *end;
++                long v = strtol(tok, &end, 10);
++                if (*end || v < 1 || v > 65535) { invalid = 1; break; }
++                arr[i++] = (uint16_t)v;
++                tok = strtok(NULL, ",");
++            }
++            if (!invalid) {
++                free(params.udp_drop_ports);
++                params.udp_drop_ports = arr;
++                params.udp_drop_ports_n = i;
++            } else { free(arr); }
++            free(opt);
++            break;
++        }
+         #ifdef __linux__
+         case 'E':
+             params.mode = MODE_TRANSPARENT;
+--- a/proxy.c	2026-11-10 03:21:53.388979510 +0700
++++ b/proxy.c	2026-11-10 03:22:30.181188215 +0700
+@@ -861,6 +861,15 @@
+                 if (params.baddr.sa.sa_family != addr.sa.sa_family) {
+                     return -1;
+                 }
++                /* Drop UDP to blocked ports (QUIC on 443, etc.) */
++                uint16_t _dport = ntohs(addr.in.sin_port);
++                for (int _i = 0; _i < params.udp_drop_ports_n; _i++) {
++                    if (params.udp_drop_ports[_i] == _dport) {
++                        LOG(LOG_S, "udp drop: port=%d\n", (int)_dport);
++                        buff_ppush(pool, buff);
++                        return 0;
++                    }
++                }
+                 LOG(LOG_S, "udp addr: fd=%d, addr=%s:%d\n", 
+                     val->fd, straddr(addr).s, ntohs(addr.in.sin_port));
+                     
