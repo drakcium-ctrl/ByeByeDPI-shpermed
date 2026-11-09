@@ -1,7 +1,6 @@
 with open('app/src/main/cpp/byedpi/proxy.c', 'r') as f:
     lines = f.readlines()
 
-# Выводим строки вокруг места где должна быть вставка
 for i, line in enumerate(lines):
     if 'udp addr' in line or 'baddr' in line or 'sa_family' in line:
         start = max(0, i-3)
