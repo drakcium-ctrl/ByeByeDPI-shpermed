@@ -29,8 +29,45 @@ jobs:
         run: |
           patch -p1 < byedpi-engine-fuzz.patch
           patch -p1 < byebyedpi-mutation.patch
+
           cd app/src/main/cpp/byedpi
-          patch -p1 < ../../../../../byedpi-udp-drop-port.patch
+
+          patch -p1 < ../../../../../byedpi-udp-drop-port.patch --forward || true
+
+          python3 - <<'EOF'
+import re
+
+with open('proxy.c', 'r') as f:
+    content = f.read()
+
+needle = '''                if (params.baddr.sa.sa_family != addr.sa.sa_family) {
+                    return -1;
+                }
+                LOG(LOG_S, "udp addr:'''
+
+replacement = '''                if (params.baddr.sa.sa_family != addr.sa.sa_family) {
+                    return -1;
+                }
+                /* Drop UDP to blocked ports (QUIC on 443, etc.) */
+                uint16_t _dport = ntohs(addr.in.sin_port);
+                for (int _i = 0; _i < params.udp_drop_ports_n; _i++) {
+                    if (params.udp_drop_ports[_i] == _dport) {
+                        LOG(LOG_S, "udp drop: port=%d\\n", (int)_dport);
+                        buff_ppush(pool, buff);
+                        return 0;
+                    }
+                }
+                LOG(LOG_S, "udp addr:'''
+
+if needle in content:
+    content = content.replace(needle, replacement, 1)
+    with open('proxy.c', 'w') as f:
+        f.write(content)
+    print("proxy.c patched successfully")
+else:
+    print("ERROR: context not found in proxy.c")
+    exit(1)
+EOF
 
       - name: Build APK
         run: ./gradlew assembleDebug
